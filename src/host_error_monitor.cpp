@@ -28,6 +28,9 @@ namespace host_error_monitor
 static boost::asio::io_service io;
 static std::shared_ptr<sdbusplus::asio::connection> conn;
 static std::shared_ptr<sdbusplus::asio::dbus_interface> hostErrorTimeoutIface;
+static std::shared_ptr<sdbusplus::asio::dbus_interface> caterrIface;
+static std::shared_ptr<sdbusplus::asio::dbus_interface> cpu1ThermIface;
+static std::shared_ptr<sdbusplus::asio::dbus_interface> cpu2ThermIface;
 
 static bool hostOff = true;
 
@@ -94,6 +97,11 @@ static boost::asio::posix::stream_descriptor cpu2MemtripEvent(io);
 // beep function for CPU error
 const static constexpr uint8_t beepCPUErr2 = 5;
 
+static constexpr uint16_t BMCGenID = 0x0020;
+static uint8_t caterr_assert = 0;
+static uint8_t cpu1_thermtrip_assert = 0;
+static uint8_t cpu2_thermtrip_assert = 0;
+
 static void beep(const uint8_t& beepPriority)
 {
     conn->async_method_call(
@@ -108,6 +116,24 @@ static void beep(const uint8_t& beepPriority)
         },
         "xyz.openbmc_project.BeepCode", "/xyz/openbmc_project/BeepCode",
         "xyz.openbmc_project.BeepCode", "Beep", uint8_t(beepPriority));
+}
+
+static void addSELLog(std::string message, std::string path,
+                    std::vector<uint8_t> selData, bool assert, uint16_t genId)
+{
+    conn->async_method_call(
+        [](boost::system::error_code ec) {
+             if (ec)
+            {
+                std::cerr << "addSELLog returned error with "
+                             "async_method_call (ec = "
+                          << ec << ")\n";
+                return;
+            }
+        },
+        "xyz.openbmc_project.Logging.IPMI", "/xyz/openbmc_project/Logging/IPMI",
+        "xyz.openbmc_project.Logging.IPMI","IpmiSelAdd",
+        message, path, selData, assert, genId);
 }
 
 static void cpuIERRLog()
@@ -178,6 +204,24 @@ static void cpuThermTripLog(const int cpuNum)
                     LOG_INFO, "REDFISH_MESSAGE_ID=%s",
                     "OpenBMC.0.1.CPUThermalTrip", "REDFISH_MESSAGE_ARGS=%d",
                     cpuNum, NULL);
+
+    std::vector<uint8_t> eventData(3, 0xFF);
+    std::string objpath;
+    if (cpuNum == 1)
+    {
+        std::string objpath = "/xyz/openbmc_project/host_error_monitor/processor/CPU0_ThermalTrip";
+        cpu1ThermIface->set_property("ThermalTrip", true);
+        cpu1_thermtrip_assert = 1;
+    }
+    else if (cpuNum == 2)
+    {
+        std::string objpath = "/xyz/openbmc_project/host_error_monitor/processor/CPU1_ThermalTrip";
+        cpu2ThermIface->set_property("ThermalTrip", true);
+        cpu2_thermtrip_assert = 1;
+    }
+    msg.append(" Asserted");
+    eventData[0] = 0x01;
+    addSELLog(msg, objpath, eventData, true, BMCGenID);
 }
 
 static void memThermTripLog(const int cpuNum)
@@ -431,13 +475,11 @@ static void incrementCPUErrorCount(int cpuNum)
             {
                 std::cerr << "Failed to read " << propertyName << ": "
                           << ec.message() << "\n";
-                return;
             }
             const uint8_t* errorCountVariant = std::get_if<uint8_t>(&property);
             if (errorCountVariant == nullptr)
             {
                 std::cerr << propertyName << " invalid\n";
-                return;
             }
             uint8_t errorCount = *errorCountVariant;
             if (errorCount == std::numeric_limits<uint8_t>::max())
@@ -693,15 +735,11 @@ static void caterrAssertHandler()
         conn->async_method_call(
             [](boost::system::error_code ec,
                const std::variant<bool>& property) {
-                if (ec)
-                {
-                    return;
-                }
+
                 const bool* reset = std::get_if<bool>(&property);
                 if (reset == nullptr)
                 {
                     std::cerr << "Unable to read reset on CATERR value\n";
-                    return;
                 }
                 startCrashdumpAndRecovery(*reset, "IERR");
             },
@@ -709,6 +747,13 @@ static void caterrAssertHandler()
             "/xyz/openbmc_project/control/processor_error_config",
             "org.freedesktop.DBus.Properties", "Get",
             "xyz.openbmc_project.Control.Processor.ErrConfig", "ResetOnCATERR");
+
+        caterrIface->set_property("IERR", true);
+        std::vector<uint8_t> eventData(3, 0xFF);
+        eventData[0] = 0x00;
+        addSELLog("IERR Asserted", "/xyz/openbmc_project/host_error_monitor/processor/CATERR",
+                  eventData, true, BMCGenID);
+        caterr_assert = 1;
     });
 }
 
@@ -726,6 +771,15 @@ static void caterrHandler()
         }
         else
         {
+            if (caterrLine.get_value() == 1 && caterr_assert == 1)
+            {
+                caterrIface->set_property("IERR", false);
+                std::vector<uint8_t> eventData(3, 0xFF);
+                eventData[0] = 0x00;
+                addSELLog("IERR De-asserted", "/xyz/openbmc_project/host_error_monitor/processor/CATERR",
+                          eventData, false, BMCGenID);
+                caterr_assert = 0;
+            }
             caterrAssertTimer.cancel();
         }
     }
@@ -764,6 +818,19 @@ static void cpu1ThermtripHandler()
         if (cpu1Thermtrip)
         {
             cpu1ThermtripAssertHandler();
+        }
+        else
+        {
+            if (cpu1ThermtripLine.get_value() == 1 && cpu1_thermtrip_assert == 1)
+            {
+                cpu1ThermIface->set_property("ThermalTrip", false);
+                std::vector<uint8_t> eventData(3, 0xFF);
+                eventData[0] = 0x01;
+                addSELLog("CPU 1 thermal trip De-assertd", 
+                          "/xyz/openbmc_project/host_error_monitor/processor/CPU0_ThermalTrip", 
+                          eventData, false, BMCGenID);
+                cpu1_thermtrip_assert = 0;
+            }
         }
     }
     cpu1ThermtripEvent.async_wait(
@@ -828,6 +895,19 @@ static void cpu2ThermtripHandler()
         if (cpu2Thermtrip)
         {
             cpu2ThermtripAssertHandler();
+        }
+        else
+        {
+            if (cpu2ThermtripLine.get_value() == 1 && cpu2_thermtrip_assert == 1)
+            {
+                cpu2ThermIface->set_property("ThermalTrip", false);
+                std::vector<uint8_t> eventData(3, 0xFF);
+                eventData[0] = 0x01;
+                addSELLog("CPU 2 thermal trip De-assertd", 
+                          "/xyz/openbmc_project/host_error_monitor/processor/CPU1_ThermalTrip", 
+                          eventData, false, BMCGenID);
+                cpu2_thermtrip_assert = 0;
+            }
         }
     }
     cpu2ThermtripEvent.async_wait(
@@ -1264,15 +1344,11 @@ static void err2AssertHandler()
         conn->async_method_call(
             [](boost::system::error_code ec,
                const std::variant<bool>& property) {
-                if (ec)
-                {
-                    return;
-                }
+
                 const bool* reset = std::get_if<bool>(&property);
                 if (reset == nullptr)
                 {
                     std::cerr << "Unable to read reset on ERR2 value\n";
-                    return;
                 }
                 startCrashdumpAndRecovery(*reset, "ERR2 Timeout");
             },
@@ -1335,15 +1411,11 @@ static void smiAssertHandler()
         conn->async_method_call(
             [](boost::system::error_code ec,
                const std::variant<bool>& property) {
-                if (ec)
-                {
-                    return;
-                }
+
                 const bool* reset = std::get_if<bool>(&property);
                 if (reset == nullptr)
                 {
                     std::cerr << "Unable to read reset on SMI value\n";
-                    return;
                 }
 #ifdef HOST_ERROR_CRASHDUMP_ON_SMI_TIMEOUT
                 startCrashdumpAndRecovery(*reset, "SMI Timeout");
@@ -1452,7 +1524,7 @@ static void initializeErrorState()
     {
         cpu1VRHotAssertHandler();
     }
-
+/*
     // Handle CPU1_MEM_ABCD_VRHOT if it's asserted now
     if (cpu1MemABCDVRHotLine.get_value() == 0)
     {
@@ -1464,13 +1536,13 @@ static void initializeErrorState()
     {
         cpu1MemEFGHVRHotAssertHandler();
     }
-
+*/
     // Handle CPU2_VRHOT if it's asserted now
     if (cpu2VRHotLine.get_value() == 0)
     {
         cpu2VRHotAssertHandler();
     }
-
+/*
     // Handle CPU2_MEM_ABCD_VRHOT if it's asserted now
     if (cpu2MemABCDVRHotLine.get_value() == 0)
     {
@@ -1482,7 +1554,7 @@ static void initializeErrorState()
     {
         cpu2MemEFGHVRHotAssertHandler();
     }
-
+*/
     // Handle PCH_BMC_THERMTRIP if it's asserted now
     if (pchThermtripLine.get_value() == 0)
     {
@@ -1525,6 +1597,30 @@ int main(int argc, char* argv[])
         },
         [](std::size_t& resp) { return host_error_monitor::caterrTimeoutMs; });
     host_error_monitor::hostErrorTimeoutIface->initialize();
+
+    host_error_monitor::caterrIface = 
+        server.add_interface(
+        "/xyz/openbmc_project/host_error_monitor/processor/CATERR",
+        "xyz.openbmc_project.HostErrorMonitor.Processor.CATERR");
+    host_error_monitor::caterrIface->register_property("IERR", false,
+        sdbusplus::asio::PropertyPermission::readWrite);
+    host_error_monitor::caterrIface->initialize();
+
+    host_error_monitor::cpu1ThermIface = 
+        server.add_interface(
+        "/xyz/openbmc_project/host_error_monitor/processor/CPU0_ThermalTrip",
+        "xyz.openbmc_project.HostErrorMonitor.Processor.CPU0ThermalTrip");
+    host_error_monitor::cpu1ThermIface->register_property("ThermalTrip", false,
+        sdbusplus::asio::PropertyPermission::readWrite);
+    host_error_monitor::cpu1ThermIface->initialize();
+
+    host_error_monitor::cpu2ThermIface = 
+        server.add_interface(
+        "/xyz/openbmc_project/host_error_monitor/processor/CPU1_ThermalTrip",
+        "xyz.openbmc_project.HostErrorMonitor.Processor.CPU1ThermalTrip");
+    host_error_monitor::cpu2ThermIface->register_property("ThermalTrip", false,
+        sdbusplus::asio::PropertyPermission::readWrite);
+    host_error_monitor::cpu2ThermIface->initialize();
 
     // Start tracking host state
     std::shared_ptr<sdbusplus::bus::match::match> hostStateMonitor =
@@ -1615,22 +1711,16 @@ int main(int argc, char* argv[])
     }
 
     // Request CPU1_MEM_ABCD_VRHOT GPIO events
-    if (!host_error_monitor::requestGPIOEvents(
+    host_error_monitor::requestGPIOEvents(
             "CPU1_MEM_ABCD_VRHOT", host_error_monitor::cpu1MemABCDVRHotHandler,
             host_error_monitor::cpu1MemABCDVRHotLine,
-            host_error_monitor::cpu1MemABCDVRHotEvent))
-    {
-        return -1;
-    }
+            host_error_monitor::cpu1MemABCDVRHotEvent);
 
     // Request CPU1_MEM_EFGH_VRHOT GPIO events
-    if (!host_error_monitor::requestGPIOEvents(
+    host_error_monitor::requestGPIOEvents(
             "CPU1_MEM_EFGH_VRHOT", host_error_monitor::cpu1MemEFGHVRHotHandler,
             host_error_monitor::cpu1MemEFGHVRHotLine,
-            host_error_monitor::cpu1MemEFGHVRHotEvent))
-    {
-        return -1;
-    }
+            host_error_monitor::cpu1MemEFGHVRHotEvent);
 
     // Request CPU2_VRHOT GPIO events
     if (!host_error_monitor::requestGPIOEvents(
@@ -1642,22 +1732,16 @@ int main(int argc, char* argv[])
     }
 
     // Request CPU2_MEM_ABCD_VRHOT GPIO events
-    if (!host_error_monitor::requestGPIOEvents(
+    host_error_monitor::requestGPIOEvents(
             "CPU2_MEM_ABCD_VRHOT", host_error_monitor::cpu2MemABCDVRHotHandler,
             host_error_monitor::cpu2MemABCDVRHotLine,
-            host_error_monitor::cpu2MemABCDVRHotEvent))
-    {
-        return -1;
-    }
+            host_error_monitor::cpu2MemABCDVRHotEvent);
 
     // Request CPU2_MEM_EFGH_VRHOT GPIO events
-    if (!host_error_monitor::requestGPIOEvents(
+    host_error_monitor::requestGPIOEvents(
             "CPU2_MEM_EFGH_VRHOT", host_error_monitor::cpu2MemEFGHVRHotHandler,
             host_error_monitor::cpu2MemEFGHVRHotLine,
-            host_error_monitor::cpu2MemEFGHVRHotEvent))
-    {
-        return -1;
-    }
+            host_error_monitor::cpu2MemEFGHVRHotEvent);
 
     // Request PCH_BMC_THERMTRIP GPIO events
     if (!host_error_monitor::requestGPIOEvents(
